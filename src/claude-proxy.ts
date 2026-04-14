@@ -95,37 +95,24 @@ const server = Bun.serve({
     }
 
     // Build upstream URL
-    const upstreamUrl = new URL(url.pathname + url.search, upstream.url);
-
-    // Clone and clean headers — replace auth with upstream token
-    const headers = new Headers(req.headers);
-    headers.set("Authorization", `Bearer ${upstream.token}`);
-    headers.set("X-Api-Key", upstream.token);
-    headers.delete("host");
-    headers.delete("connection"); // let fetch manage keep-alive
+    const upstreamUrl = `${upstream.url}${url.pathname}${url.search}`;
 
     try {
-      const upstreamReq = new Request(upstreamUrl.toString(), {
+      const upstreamRes = await fetch(upstreamUrl, {
         method: req.method,
-        headers,
-        body: req.method !== "GET" && req.method !== "HEAD" ? body : undefined,
-        // @ts-expect-error - duplex is valid in Bun
-        duplex: "half",
+        headers: {
+          "Authorization": `Bearer ${upstream.token}`,
+          "Content-Type": req.headers.get("Content-Type") ?? "application/json",
+          "Accept": req.headers.get("Accept") ?? "text/event-stream, application/json",
+          "anthropic-version": req.headers.get("anthropic-version") ?? "2023-06-01",
+        },
+        body,
       });
 
-      const upstreamRes = await fetch(upstreamReq);
-
-      // Stream the response back with same status
-      const responseHeaders = new Headers();
-      upstreamRes.headers.forEach((value, key) => {
-        responseHeaders.set(key, value);
-      });
-
-      const stream = upstreamRes.body;
-
-      return new Response(stream, {
+      // Pass through upstream response as-is
+      return new Response(upstreamRes.body, {
         status: upstreamRes.status,
-        headers: responseHeaders,
+        headers: upstreamRes.headers,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown upstream error";

@@ -22,28 +22,38 @@
 // ---------------------------------------------------------------------------
 
 const PROXY_PORT = parseInt(process.env.PROXY_PORT ?? "3472", 10);
-const ZAI_TOKEN = process.env.ZAI_API_TOKEN ?? "";
-const MINIMAX_TOKEN = process.env.MINIMAX_API_TOKEN ?? "";
 
-interface Upstream {
-  url: string;
-  token: string;
-}
+// Tokens are re-read at request time so env var changes (User scope)
+// take effect without restarting the proxy
+const getTokens = () => {
+  const { spawnSync } = require("node:child_process");
+  const run = (cmd: string) => {
+    const r = spawnSync("powershell", ["-NoProfile", "-Command", cmd], { encoding: "utf8" });
+    return (r.stdout ?? "").trim();
+  };
+  return {
+    zai: run(`[System.Environment]::GetEnvironmentVariable('CLAUDE_PROFILE_ZAI_TOKEN','User')`),
+    minimax: run(`[System.Environment]::GetEnvironmentVariable('CLAUDE_PROFILE_MINIMAX_TOKEN','User')`),
+  };
+};
 
-const UPSTREAMS: Record<string, Upstream> = {
+const UPSTREAMS: Record<string, { url: string; token: string }> = {
   zai: {
     url: "https://api.z.ai/api/anthropic",
-    token: ZAI_TOKEN,
+    token: "", // filled dynamically
   },
   minimax: {
     url: "https://api.minimax.io/anthropic",
-    token: MINIMAX_TOKEN,
+    token: "", // filled dynamically
   },
 };
 
 // ---------------------------------------------------------------------------
-// Routing
+// Startup
 // ---------------------------------------------------------------------------
+
+console.log(`[proxy] Claude routing proxy listening on http://localhost:${PROXY_PORT}`);
+console.log(`[proxy] Tokens are re-read from User env on every request (dynamic)`);
 
 /** Determine upstream key from the model name in the request body */
 const routeModel = (body: string): string => {
@@ -83,11 +93,16 @@ const server = Bun.serve({
     // Collect body
     const body = await req.text();
 
-    // Route to upstream based on model
+    // Route to upstream based on model (tokens re-read per request)
     const upstreamKey = routeModel(body);
+    const { zai: zaiToken, minimax: minimaxToken } = getTokens();
+    const token = upstreamKey === "minimax" ? minimaxToken : zaiToken;
     const upstream = UPSTREAMS[upstreamKey];
 
-    if (!upstream?.token) {
+    console.log(`[proxy] request body model: ${JSON.parse(body)?.model ?? "unknown"} → ${upstreamKey}`);
+    console.log(`[proxy] sending Authorization: Bearer ${token?.slice(0,15) ?? "MISSING"}...`);
+
+    if (!token) {
       return Response.json(
         { error: `Missing API token for upstream: ${upstreamKey}` },
         { status: 502 },
@@ -99,13 +114,16 @@ const server = Bun.serve({
 
     // Strip encoding headers so upstream returns uncompressed response
     // (Claude Code handles decompression itself)
+    // Also strip existing auth headers from client - we set our own
     const headers: Record<string, string> = {};
-    for (const [key, value] of req.headers) {
-      if (key === "host" || key === "accept-encoding") continue;
+    req.headers.forEach((value: string, key: string) => {
+      const lk = key.toLowerCase();
+      if (lk === "host" || lk === "accept-encoding" || lk === "authorization" || lk === "x-api-key") return;
       headers[key] = value;
-    }
-    headers["Authorization"] = `Bearer ${upstream.token}`;
-    headers["X-Api-Key"] = upstream.token;
+    });
+    const upstreamToken = upstreamKey === "minimax" ? minimaxToken : zaiToken;
+    headers["Authorization"] = `Bearer ${upstreamToken}`;
+    headers["X-Api-Key"] = upstreamToken;
     headers["Connection"] = "close"; // avoid connection reuse issues
 
     try {
@@ -134,6 +152,5 @@ const server = Bun.serve({
 });
 
 console.log(`[proxy] Claude routing proxy listening on http://localhost:${server.port}`);
-console.log(`[proxy] Z.AI token:     ${ZAI_TOKEN ? "✓ set" : "✗ MISSING"}`);
-console.log(`[proxy] MiniMax token:  ${MINIMAX_TOKEN ? "✓ set" : "✗ MISSING"}`);
+console.log(`[proxy] Tokens are re-read from User env on every request (dynamic)`);
 console.log(`[proxy] Routing:        MiniMax-* → MiniMax | glm-* / others → Z.AI`);

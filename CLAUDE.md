@@ -7,8 +7,8 @@ This is the `cc-open-models-routing` project — a local HTTP proxy and CLI tool
 ## Architecture
 
 - **`src/claude-proxy.ts`** — Bun HTTP proxy server. Listens on port 3472. Routes:
-  - `MiniMax-*` model → `https://api.minimax.io/anthropic`
-  - `glm-*` / other → `https://api.z.ai/api/anthropic`
+  - `MiniMax-*` (case-insensitive) model → `https://api.minimax.io/anthropic`
+  - All other models → `https://api.z.ai/api/anthropic`
   - Streaming-compatible (SSE).
 
 - **`src/claude-model-switcher.ts`** — CLI tool to switch Claude Code profiles:
@@ -32,8 +32,16 @@ Set them via PowerShell:
 
 - **Apply `efficiency`**: Proxy is spawned as detached background process. PID stored in `~/.claude/model-switcher-state.json`.
 - **Switch away**: Proxy is killed and port freed.
-- **Idle recovery**: Any switcher invocation checks if efficiency proxy is dead and restarts it.
+- **Idle recovery**: Any switcher invocation (`cc`, `bun run switcher:*`, etc.) checks if efficiency proxy is dead and restarts it.
 - **Computer restart**: Proxy dies. On next switcher command, idle recovery restarts it.
+
+## The `cc` Launcher
+
+`bin/cc.cmd` is the recommended way to start Claude in efficiency mode:
+1. Calls switcher with `--ensure-proxy` (idle recovery)
+2. Launches `claude --dangerously-bypass-permissions`
+
+`bin/cc-use-efficiency.cmd` does both in one step: applies efficiency profile + starts Claude.
 
 ## Port
 
@@ -45,8 +53,9 @@ Set them via PowerShell:
 bun run src/claude-proxy.ts        # Start proxy (foreground)
 curl http://localhost:3472/health  # Should return {"status":"ok"}
 
-bun run src/claude-model-switcher.ts --apply efficiency --smoke-test
-bun run src/claude-model-switcher.ts --status
+bun run switcher --ensure-proxy    # Ensure proxy running, exit
+bun run switcher --status         # Show current profile + proxy status
+bun run switcher --apply efficiency --smoke-test
 ```
 
 ## Security Notes

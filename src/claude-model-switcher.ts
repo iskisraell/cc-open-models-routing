@@ -558,6 +558,7 @@ const main = async () => {
   const shouldExitShell = hasFlag("--exit-shell");
   const shouldStartProxy = hasFlag("--proxy-start");
   const shouldStopProxy = hasFlag("--proxy-stop");
+  const shouldEnsureProxy = hasFlag("--ensure-proxy");
 
   // Proxy-only commands
   if (shouldStopProxy) {
@@ -571,6 +572,24 @@ const main = async () => {
       console.log("Proxy start is only needed for efficiency mode.");
     }
     await startProxy();
+    return;
+  }
+
+  // --ensure-proxy: ensure proxy is running for efficiency, then exit.
+  // Used by the `cc` launcher to bootstrap before starting Claude.
+  if (shouldEnsureProxy) {
+    const state = await loadState();
+    if (state.activeProfile === "efficiency") {
+      const running = state.proxyPid ? await isProxyRunning() : false;
+      if (running) {
+        console.log(`Proxy already running (PID ${state.proxyPid}), port ${PROXY_PORT}.`);
+      } else {
+        console.log("Proxy was not running. Starting...");
+        await startProxy();
+      }
+    } else {
+      console.log(`Not in efficiency mode (profile: ${state.activeProfile ?? "unknown"}). No proxy needed.`);
+    }
     return;
   }
 

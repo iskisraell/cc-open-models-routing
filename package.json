@@ -1,0 +1,20 @@
+{
+  "name": "cc-open-models-routing",
+  "version": "0.1.0",
+  "description": "Local proxy for routing Claude Code requests between GLM (z.ai) and MiniMax based on model tier",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "switcher": "bun run src/claude-model-switcher.ts",
+    "switcher:glm": "bun run src/claude-model-switcher.ts --apply glm-5.1",
+    "switcher:minimax": "bun run src/claude-model-switcher.ts --apply minimax-m2.7",
+    "switcher:efficiency": "bun run src/claude-model-switcher.ts --apply efficiency",
+    "switcher:status": "bun run src/claude-model-switcher.ts --status",
+    "proxy": "bun run src/claude-proxy.ts",
+    "proxy:start": "bun run src/claude-model-switcher.ts --proxy-start",
+    "proxy:stop": "bun run src/claude-model-switcher.ts --proxy-stop"
+  },
+  "dependencies": {
+    "@opentui/core": "^0.1.95"
+  }
+}

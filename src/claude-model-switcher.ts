@@ -5,7 +5,7 @@ import {
   TextRenderable,
 } from "@opentui/core";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdir, readFile, writeFile, unlink } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -19,9 +19,8 @@ interface ClaudeProfile {
   provider: string;
   model: string;
   baseUrl: string;
-  /** Primary token env var name */
   tokenEnvVar: string;
-  /** Extra token env var (efficiency mode needs both z.ai + minimax) */
+  /** Efficiency mode needs both Z.AI and MiniMax tokens */
   tokenEnvVar2?: string;
   disableNonessentialTraffic: boolean;
   note: string;
@@ -78,7 +77,7 @@ const profiles: ClaudeProfile[] = [
     baseUrl: "https://api.z.ai/api/anthropic",
     tokenEnvVar: "CLAUDE_PROFILE_ZAI_TOKEN",
     disableNonessentialTraffic: false,
-    note: "Direct Z.AI routing — GLM 5.1 for all tasks",
+    note: "Current Z.AI routing",
   },
   {
     id: "minimax-m2.7",
@@ -88,24 +87,20 @@ const profiles: ClaudeProfile[] = [
     baseUrl: "https://api.minimax.io/anthropic",
     tokenEnvVar: "CLAUDE_PROFILE_MINIMAX_TOKEN",
     disableNonessentialTraffic: true,
-    note: "Direct MiniMax routing — MiniMax M2.7 for all tasks",
+    note: "Claude-compatible routing via MiniMax token plan",
   },
   {
     id: "efficiency",
     name: "Efficiency",
     provider: "Local Proxy",
     model: "glm-5.1",
-    baseUrl: `http://localhost:${PROXY_PORT}`,
+    baseUrl: "http://localhost:3472",
     tokenEnvVar: "CLAUDE_PROFILE_ZAI_TOKEN",
     tokenEnvVar2: "CLAUDE_PROFILE_MINIMAX_TOKEN",
     disableNonessentialTraffic: true,
-    note: "Opus tier → GLM 5.1 (z.ai) | Sonnet/Haiku tier → MiniMax M2.7 (MiniMax)",
+    note: "Opus tier → GLM 5.1 (z.ai) | Sonnet/Haiku tier → MiniMax M2.7",
   },
 ];
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 const args = process.argv.slice(2);
 
@@ -166,15 +161,6 @@ const resolveProfile = (id: string | undefined) => {
   return profile;
 };
 
-const loadSettings = async () => readJson<ClaudeSettings>(settingsPath, {});
-
-const loadState = async (): Promise<SwitcherState> =>
-  readJson<SwitcherState>(statePath, {});
-
-// ---------------------------------------------------------------------------
-// Token resolution
-// ---------------------------------------------------------------------------
-
 const getProfileToken = (profile: ClaudeProfile) => {
   const token = getUserEnv(profile.tokenEnvVar);
   if (!token) {
@@ -193,30 +179,6 @@ const getProfileToken2 = (profile: ClaudeProfile) => {
 };
 
 // ---------------------------------------------------------------------------
-// Profile env builder
-// ---------------------------------------------------------------------------
-
-const buildManagedEnv = (profile: ClaudeProfile) => {
-  const token = getProfileToken(profile);
-
-  return {
-    ANTHROPIC_AUTH_TOKEN: token,
-    ANTHROPIC_BASE_URL: profile.baseUrl,
-    API_TIMEOUT_MS: "3000000",
-    ANTHROPIC_MODEL: profile.model,
-    ANTHROPIC_SMALL_FAST_MODEL: profile.model,
-    ANTHROPIC_DEFAULT_SONNET_MODEL: profile.model,
-    ANTHROPIC_DEFAULT_OPUS_MODEL: profile.model,
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: profile.model,
-    CLAUDE_CODE_SUBAGENT_MODEL: profile.model,
-    CLAUDE_MODEL_PROFILE: profile.id,
-    ...(profile.disableNonessentialTraffic
-      ? { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" }
-      : {}),
-  } satisfies Record<string, string>;
-};
-
-// ---------------------------------------------------------------------------
 // Proxy lifecycle
 // ---------------------------------------------------------------------------
 
@@ -224,12 +186,8 @@ const buildManagedEnv = (profile: ClaudeProfile) => {
 const isProxyRunning = async (): Promise<boolean> => {
   const state = await loadState();
   if (!state.proxyPid) return false;
-
   try {
-    // On Windows, use tasklist to check if process exists
-    const result = spawnSync("tasklist", ["/FI", `PID eq ${state.proxyPid}`, "/NH"], {
-      encoding: "utf8",
-    });
+    const result = spawnSync("tasklist", ["/FI", `PID eq ${state.proxyPid}`, "/NH"], { encoding: "utf8" });
     return result.stdout.includes(String(state.proxyPid));
   } catch {
     return false;
@@ -239,17 +197,13 @@ const isProxyRunning = async (): Promise<boolean> => {
 /** Check if port 3472 is currently bound */
 const isPortBound = async (): Promise<boolean> => {
   return new Promise((resolve) => {
-    const proc = spawn(
-      "powershell",
-      [
-        "-NoProfile",
-        "-Command",
-        `netstat -ano | findstr :${PROXY_PORT} | findstr LISTENING`,
-      ],
-      { encoding: "utf8" },
-    );
+    const proc = spawn("powershell", [
+      "-NoProfile",
+      "-Command",
+      `netstat -ano | findstr :${PROXY_PORT} | findstr LISTENING`,
+    ], { encoding: "utf8" });
     let output = "";
-    proc.stdout?.on("data", (d) => { output += d; });
+    proc.stdout?.on("data", (d: string) => { output += d; });
     proc.on("close", () => resolve(output.trim().length > 0));
   });
 };
@@ -267,114 +221,101 @@ const killPid = (pid: number) => {
 const clearPort = async () => {
   const bound = await isPortBound();
   if (!bound) return;
-
-  // Find PID on the port
   const result = spawnSync("powershell", [
     "-NoProfile",
     "-Command",
     `(netstat -ano | findstr :${PROXY_PORT} | findstr LISTENING)[0] -split '\\s+' | Select-Object -Last 1`,
   ], { encoding: "utf8" });
-
   const pid = parseInt((result.stdout ?? "").trim(), 10);
-  if (pid && !isNaN(pid)) {
-    killPid(pid);
-  }
-
-  // Wait for port to be released
+  if (pid && !isNaN(pid)) killPid(pid);
   await new Promise((r) => setTimeout(r, 500));
 };
 
 /** Start the proxy as a detached background process */
 const startProxy = async () => {
   const state = await loadState();
-
-  // If a proxy is already running for this profile, leave it
   if (state.proxyPid && (await isProxyRunning())) {
     console.log(`Proxy already running (PID ${state.proxyPid}), port ${PROXY_PORT}.`);
     return;
   }
-
-  // Stop any stale proxy
   if (state.proxyPid) {
     killPid(state.proxyPid);
     await clearPort();
   } else {
     await clearPort();
   }
-
-  // Get both tokens for the proxy
   const zaiToken = getUserEnv("CLAUDE_PROFILE_ZAI_TOKEN");
   const minimaxToken = getUserEnv("CLAUDE_PROFILE_MINIMAX_TOKEN");
-
   if (!zaiToken) throw new Error("Missing CLAUDE_PROFILE_ZAI_TOKEN — required for efficiency mode");
   if (!minimaxToken) throw new Error("Missing CLAUDE_PROFILE_MINIMAX_TOKEN — required for efficiency mode");
-
   const scriptDir = dirname(process.argv[1] ?? import.meta.filename ?? "");
   const proxyPath = join(scriptDir, "claude-proxy.ts");
-
-  // Spawn detached proxy — inherits env, passes tokens via env
-  const child = spawn(
-    "bun",
-    ["run", proxyPath],
-    {
-      detached: true,
-      stdio: "ignore",
-      env: {
-        ...process.env,
-        PROXY_PORT: String(PROXY_PORT),
-        ZAI_API_TOKEN: zaiToken,
-        MINIMAX_API_TOKEN: minimaxToken,
-      },
+  const child = spawn("bun", ["run", proxyPath], {
+    detached: true,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      PROXY_PORT: String(PROXY_PORT),
+      ZAI_API_TOKEN: zaiToken,
+      MINIMAX_API_TOKEN: minimaxToken,
     },
-  );
-
+  });
   child.unref();
-
-  // Wait for proxy to bind
   let bound = false;
   for (let i = 0; i < 20; i++) {
     await new Promise((r) => setTimeout(r, 250));
-    if (await isPortBound()) {
-      bound = true;
-      break;
-    }
+    if (await isPortBound()) { bound = true; break; }
   }
-
-  if (!bound) {
-    throw new Error("Proxy failed to start on port 3472 within 5 seconds.");
-  }
-
-  // Update state with new PID
-  const newState: SwitcherState = {
-    ...state,
-    activeProfile: state.activeProfile,
-    proxyPid: child.pid,
-    proxyPort: PROXY_PORT,
-    lastSwitchedAt: new Date().toISOString(),
-  };
+  if (!bound) throw new Error(`Proxy failed to start on port ${PROXY_PORT} within 5 seconds.`);
+  const newState: SwitcherState = { ...state, proxyPid: child.pid, proxyPort: PROXY_PORT };
   await writeJson(statePath, newState);
-
   console.log(`Proxy started on port ${PROXY_PORT} (PID ${child.pid}).`);
 };
 
 /** Stop the running proxy */
 const stopProxy = async () => {
   const state = await loadState();
-  if (!state.proxyPid) {
+  if (state.proxyPid) {
+    killPid(state.proxyPid);
     await clearPort();
-    return;
+    await writeJson(statePath, { ...state, proxyPid: undefined, proxyPort: undefined });
+    console.log(`Proxy stopped (was PID ${state.proxyPid}).`);
+  } else {
+    await clearPort();
   }
-
-  killPid(state.proxyPid);
-  await clearPort();
-
-  await writeJson(statePath, { ...state, proxyPid: undefined, proxyPort: undefined });
-  console.log(`Proxy stopped (was PID ${state.proxyPid}).`);
 };
 
 // ---------------------------------------------------------------------------
-// Active profile detection
+// State loader
 // ---------------------------------------------------------------------------
+
+const loadState = async (): Promise<SwitcherState> =>
+  readJson<SwitcherState>(statePath, {});
+
+const buildManagedEnv = (profile: ClaudeProfile) => {
+  const token = getProfileToken(profile);
+  const isEfficiency = profile.id === "efficiency";
+
+  return {
+    ANTHROPIC_AUTH_TOKEN: token,
+    ANTHROPIC_BASE_URL: profile.baseUrl,
+    API_TIMEOUT_MS: "3000000",
+    // Efficiency: Opus → GLM-5.1, Sonnet/Haiku → MiniMax-M2.7
+    // Single-provider: all tiers → same model
+    ANTHROPIC_MODEL: isEfficiency ? "glm-5.1" : profile.model,
+    ANTHROPIC_SMALL_FAST_MODEL: isEfficiency ? "MiniMax-M2.7" : profile.model,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: isEfficiency ? "MiniMax-M2.7" : profile.model,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: isEfficiency ? "glm-5.1" : profile.model,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: isEfficiency ? "MiniMax-M2.7" : profile.model,
+    CLAUDE_CODE_SUBAGENT_MODEL: isEfficiency ? "MiniMax-M2.7" : profile.model,
+    CLAUDE_MODEL_PROFILE: profile.id,
+    ...(profile.disableNonessentialTraffic
+      ? { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" }
+      : {}),
+  } satisfies Record<string, string>;
+};
+
+const loadSettings = async () => readJson<ClaudeSettings>(settingsPath, {});
 
 const detectActiveProfile = async () => {
   const state = await loadState();
@@ -398,10 +339,6 @@ const detectActiveProfile = async () => {
     )?.id ?? null
   );
 };
-
-// ---------------------------------------------------------------------------
-// Apply profile
-// ---------------------------------------------------------------------------
 
 const applyProfile = async (profile: ClaudeProfile) => {
   const settings = await loadSettings();
@@ -429,14 +366,11 @@ const applyProfile = async (profile: ClaudeProfile) => {
   await writeJson(settingsPath, nextSettings);
   await writeJson(snapshotPathByProfile[profile.id], { env: managedEnv });
 
-  // Manage proxy lifecycle based on profile
+  // Manage proxy lifecycle
   if (profile.id === "efficiency") {
     await startProxy();
-  } else {
-    // Switching away from efficiency — stop the proxy
-    if (state.activeProfile === "efficiency") {
-      await stopProxy();
-    }
+  } else if (state.activeProfile === "efficiency") {
+    await stopProxy();
   }
 
   await writeJson(statePath, {
@@ -457,29 +391,22 @@ const applyProfile = async (profile: ClaudeProfile) => {
   return managedEnv;
 };
 
-// ---------------------------------------------------------------------------
-// Status
-// ---------------------------------------------------------------------------
-
 const printStatus = async () => {
   const state = await loadState();
   const active = await detectActiveProfile();
   const settings = await loadSettings();
-  const profile = profiles.find((p) => p.id === active);
 
   console.log(`active_profile=${active ?? "unknown"}`);
   console.log(`settings_path=${settingsPath}`);
   console.log(`model=${settings.env?.ANTHROPIC_MODEL ?? "<unset>"}`);
   console.log(`base_url=${settings.env?.ANTHROPIC_BASE_URL ?? "<unset>"}`);
-  console.log(`managed_token_env=${profile?.tokenEnvVar ?? "<unset>"}`);
+  console.log(
+    `managed_token_env=${profiles.find((profile) => profile.id === active)?.tokenEnvVar ?? "<unset>"}`,
+  );
   console.log(`proxy_running=${state.proxyPid ? await isProxyRunning() : false}`);
   console.log(`proxy_port=${state.proxyPort ?? "<none>"}`);
   console.log(`proxy_pid=${state.proxyPid ?? "<none>"}`);
 };
-
-// ---------------------------------------------------------------------------
-// Smoke test
-// ---------------------------------------------------------------------------
 
 const smokeTest = async (profile: ClaudeProfile) => {
   const env = {
@@ -521,10 +448,6 @@ const smokeTest = async (profile: ClaudeProfile) => {
   };
 };
 
-// ---------------------------------------------------------------------------
-// TUI
-// ---------------------------------------------------------------------------
-
 const launchTui = async () => {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     console.error(
@@ -533,10 +456,10 @@ const launchTui = async () => {
     process.exit(1);
   }
 
-  // Auto-start proxy if efficiency is active but proxy is dead
+  // Idle recovery: if efficiency was active but proxy is dead, restart it
   const state = await loadState();
   if (state.activeProfile === "efficiency" && state.proxyPid && !(await isProxyRunning())) {
-    console.log("Efficiency mode was active but proxy is not running. Restarting proxy...");
+    console.log("Efficiency mode was active but proxy is not running. Restarting...");
     await startProxy();
   }
 
@@ -556,7 +479,7 @@ const launchTui = async () => {
 
   const subtitle = new TextRenderable(renderer, {
     id: "subtitle",
-    content: `Current: ${activeProfile ?? "unknown"} | Enter to apply | Ctrl+C to exit`,
+    content: `Current profile: ${activeProfile ?? "unknown"} | Enter to apply | Ctrl+C to exit`,
     fg: "#94a3b8",
     position: "absolute",
     left: 3,
@@ -565,17 +488,20 @@ const launchTui = async () => {
 
   const menu = new SelectRenderable(renderer, {
     id: "profile-menu",
-    width: 80,
-    height: 12,
+    width: 72,
+    height: 10,
     position: "absolute",
     left: 3,
     top: 5,
     options: [
       ...profiles.map((profile) => ({
         name: `${profile.name}${profile.id === activeProfile ? " (active)" : ""}`,
-        description: `${profile.provider} | ${profile.note}`,
+        description: `${profile.provider} | ${profile.model} | ${profile.note}`,
       })),
-      { name: "Exit", description: "Close without changing the active profile" },
+      {
+        name: "Exit",
+        description: "Close without changing the active Claude profile",
+      },
     ],
   });
 
@@ -589,7 +515,7 @@ const launchTui = async () => {
     const profile = profiles[index];
     await renderer.destroy();
 
-    await applyProfile(profile);
+    await Promise.all([applyProfile(profile)]);
     const state = await loadState();
 
     console.log(`Switched Claude Code to ${profile.name}.`);
@@ -597,8 +523,9 @@ const launchTui = async () => {
     if (profile.id === "efficiency") {
       console.log(`Proxy running on port ${PROXY_PORT} (PID ${state.proxyPid}).`);
     }
-    console.log("Open a new terminal window before starting a new Claude session.");
-
+    console.log(
+      "Open a new terminal window before starting a new Claude session.",
+    );
     process.exit(0);
   });
 
@@ -620,14 +547,14 @@ const launchTui = async () => {
   });
 };
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
+const launchTuiAndExitShell = async () => {
+  await launchTui();
+};
 
 const main = async () => {
   const applyId = parseArgValue("--apply");
   const shouldPrintStatus = hasFlag("--status");
-  const shouldSmokeTestFlag = hasFlag("--smoke-test");
+  const shouldSmokeTest = hasFlag("--smoke-test");
   const shouldExitShell = hasFlag("--exit-shell");
   const shouldStartProxy = hasFlag("--proxy-start");
   const shouldStopProxy = hasFlag("--proxy-stop");
@@ -647,7 +574,7 @@ const main = async () => {
     return;
   }
 
-  // Ensure proxy is running if efficiency mode is active (idle recovery)
+  // Idle recovery: if efficiency was active but proxy died, restart it
   const state = await loadState();
   if (state.activeProfile === "efficiency" && state.proxyPid && !(await isProxyRunning())) {
     console.log("Proxy was not running for efficiency mode. Restarting...");
@@ -663,15 +590,13 @@ const main = async () => {
     const profile = resolveProfile(applyId);
     await applyProfile(profile);
     const newState = await loadState();
-
     console.log(`Switched Claude Code to ${profile.name}.`);
-
     if (profile.id === "efficiency") {
       console.log(`Proxy running on port ${PROXY_PORT} (PID ${newState.proxyPid}).`);
       console.log("Opus tier → GLM 5.1 | Sonnet/Haiku tier → MiniMax M2.7");
     }
 
-    if (shouldSmokeTestFlag) {
+    if (shouldSmokeTest) {
       const result = await smokeTest(profile);
       if (result.ok) {
         console.log("Smoke test: OK");
@@ -688,7 +613,7 @@ const main = async () => {
   }
 
   if (shouldExitShell) {
-    await launchTui();
+    await launchTuiAndExitShell();
     return;
   }
 

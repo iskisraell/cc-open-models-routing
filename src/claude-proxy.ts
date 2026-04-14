@@ -97,15 +97,21 @@ const server = Bun.serve({
     // Build upstream URL
     const upstreamUrl = `${upstream.url}${url.pathname}${url.search}`;
 
+    // Strip encoding headers so upstream returns uncompressed response
+    // (Claude Code handles decompression itself)
+    const headers: Record<string, string> = {};
+    for (const [key, value] of req.headers) {
+      if (key === "host" || key === "accept-encoding") continue;
+      headers[key] = value;
+    }
+    headers["Authorization"] = `Bearer ${upstream.token}`;
+    headers["X-Api-Key"] = upstream.token;
+    headers["Connection"] = "close"; // avoid connection reuse issues
+
     try {
       const upstreamRes = await fetch(upstreamUrl, {
         method: req.method,
-        headers: {
-          "Authorization": `Bearer ${upstream.token}`,
-          "Content-Type": req.headers.get("Content-Type") ?? "application/json",
-          "Accept": req.headers.get("Accept") ?? "text/event-stream, application/json",
-          "anthropic-version": req.headers.get("anthropic-version") ?? "2023-06-01",
-        },
+        headers,
         body,
       });
 

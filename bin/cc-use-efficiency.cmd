@@ -13,4 +13,4 @@ echo.
 echo Starting Claude Code with Efficiency mode...
 echo.
 
-claude --dangerously-bypass-permissions %*
+claude --dangerously-skip-permissions %*

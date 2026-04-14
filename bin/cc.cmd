@@ -17,4 +17,4 @@ REM Ensure proxy is running (idle recovery for efficiency mode)
 call "%~dp0claude-model-switcher-runner.cmd" --ensure-proxy
 
 REM Launch Claude Code with bypass permissions + any passed arguments
-claude --dangerously-bypass-permissions %*
+claude --dangerously-skip-permissions %*
